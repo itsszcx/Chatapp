@@ -297,6 +297,22 @@
     font-weight: 600;
   }
   .composer button:hover { background: var(--accent-dark); }
+
+  #attachBtn {
+    background: none;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    font-size: 18px;
+    padding: 0 12px;
+  }
+  #attachBtn:hover { border-color: var(--accent); }
+  #attachBtn:disabled { opacity: 0.5; }
+
+  .bubble img {
+    max-width: 100%;
+    border-radius: 4px;
+    display: block;
+  }
 </style>
 </head>
 <body>
@@ -364,6 +380,8 @@
     </div>
     <div class="messages" id="messagesEl"></div>
     <div class="composer">
+      <button id="attachBtn" title="Send a photo">📷</button>
+      <input type="file" id="imageInput" accept="image/*" style="display:none;" />
       <input type="text" id="messageInput" placeholder="Type a message…" />
       <button id="sendBtn">Send</button>
     </div>
@@ -649,7 +667,20 @@ function renderMessage(m) {
   const div = document.createElement("div");
   const mine = m.sender_id === currentProfile.id;
   div.className = "bubble " + (mine ? "mine" : "theirs");
-  div.innerHTML = `${escapeHtml(m.content)}<span class="bubble-time">${formatTime(m.created_at)}</span>`;
+
+  if (m.type === "image" && m.image_url) {
+    const img = document.createElement("img");
+    img.src = m.image_url;
+    img.alt = "Photo";
+    div.appendChild(img);
+    const timeSpan = document.createElement("span");
+    timeSpan.className = "bubble-time";
+    timeSpan.textContent = formatTime(m.created_at);
+    div.appendChild(timeSpan);
+  } else {
+    div.innerHTML = `${escapeHtml(m.content)}<span class="bubble-time">${formatTime(m.created_at)}</span>`;
+  }
+
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 }
@@ -702,6 +733,61 @@ async function sendMessage() {
 document.getElementById("sendBtn").addEventListener("click", sendMessage);
 document.getElementById("messageInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendMessage();
+});
+
+// ---------- Send a photo ----------
+const attachBtn = document.getElementById("attachBtn");
+const imageInput = document.getElementById("imageInput");
+
+attachBtn.addEventListener("click", () => {
+  if (!activeConversation) return;
+  imageInput.click();
+});
+
+imageInput.addEventListener("change", async () => {
+  const file = imageInput.files[0];
+  imageInput.value = ""; // reset so the same file can be picked again later
+  if (!file || !activeConversation) return;
+
+  if (!file.type.startsWith("image/")) {
+    alert("Please choose an image file.");
+    return;
+  }
+  if (file.size > 8 * 1024 * 1024) {
+    alert("Image is too large (max 8MB).");
+    return;
+  }
+
+  attachBtn.disabled = true;
+  attachBtn.textContent = "…";
+
+  try {
+    const ext = file.name.split(".").pop();
+    const path = `${currentProfile.id}/${activeConversation.id}-${Date.now()}.${ext}`;
+
+    const { error: uploadError } = await supabase.storage
+      .from("chat-images")
+      .upload(path, file);
+    if (uploadError) throw uploadError;
+
+    const { data: publicUrlData } = supabase.storage
+      .from("chat-images")
+      .getPublicUrl(path);
+
+    const { error: insertError } = await supabase.from("messages").insert({
+      conversation_id: activeConversation.id,
+      sender_id: currentProfile.id,
+      content: "",
+      type: "image",
+      image_url: publicUrlData.publicUrl
+    });
+    if (insertError) throw insertError;
+  } catch (err) {
+    alert("Photo failed to send: " + err.message);
+  } finally {
+    attachBtn.disabled = false;
+    attachBtn.textContent = "📷";
+  }
 });
 
 // ---------- On load, check if already logged in ----------
