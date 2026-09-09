@@ -208,6 +208,10 @@
     margin-bottom: 8px;
     cursor: pointer;
     background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
   }
   .convo-item:hover { border-color: var(--accent); }
   .convo-item .code { font-weight: 600; font-size: 15px; }
@@ -219,6 +223,33 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .convo-item .convo-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  .unread-badge {
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    min-width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 5px;
+  }
+  .convo-delete-btn {
+    background: none;
+    border: none;
+    color: var(--ink-soft);
+    font-size: 15px;
+    padding: 2px 4px;
+  }
+  .convo-delete-btn:hover { color: var(--danger); }
   .empty-state {
     color: var(--ink-soft);
     font-size: 14px;
@@ -266,12 +297,31 @@
     align-self: flex-end;
     background: var(--accent);
     color: #fff;
+    position: relative;
   }
   .bubble.theirs {
     align-self: flex-start;
     background: var(--clay);
     color: var(--ink);
   }
+  .unsend-btn {
+    position: absolute;
+    top: -8px;
+    left: -8px;
+    background: var(--ink);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 18px;
+    height: 18px;
+    font-size: 11px;
+    line-height: 1;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+  }
+  .bubble.mine:hover .unsend-btn { display: flex; }
   .bubble-time {
     font-size: 10px;
     opacity: 0.7;
@@ -313,6 +363,40 @@
     border-radius: 4px;
     display: block;
   }
+
+  .bubble.image-bubble { padding: 6px; position: relative; }
+
+  .photo-cover {
+    padding: 30px 20px;
+    text-align: center;
+    cursor: pointer;
+    font-size: 14px;
+    min-width: 160px;
+  }
+  .photo-cover .cover-sub {
+    display: block;
+    font-size: 11px;
+    opacity: 0.75;
+    margin-top: 4px;
+  }
+
+  .countdown-overlay {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 10px;
+  }
+
+  .expired-photo {
+    padding: 16px 20px;
+    font-size: 13px;
+    color: var(--ink-soft);
+    font-style: italic;
+  }
 </style>
 </head>
 <body>
@@ -349,7 +433,10 @@
   <div id="homeScreen" class="screen">
     <div class="home-header">
       <div class="wordmark">WIRE</div>
-      <button id="logoutBtn">Sign out</button>
+      <div style="display:flex; gap:14px; align-items:center;">
+        <button id="editNameBtn" style="background:none; border:none; color:var(--ink-soft); font-size:13px; text-decoration:underline;">Edit name</button>
+        <button id="logoutBtn">Sign out</button>
+      </div>
     </div>
 
     <div class="your-code-block">
@@ -528,14 +615,36 @@ async function loadSessionAndGo() {
   document.getElementById("yourCode").textContent = profile.unique_code;
   showScreen("homeScreen");
   loadConversations();
+  subscribeToHomeUpdates();
 }
 
 // ---------- Sign out ----------
 document.getElementById("logoutBtn").addEventListener("click", async () => {
   await supabase.auth.signOut();
+  if (homeChannel) { supabase.removeChannel(homeChannel); homeChannel = null; }
   currentUser = null;
   currentProfile = null;
   showScreen("authScreen");
+});
+
+// ---------- Edit display name ----------
+document.getElementById("editNameBtn").addEventListener("click", async () => {
+  const newName = window.prompt("Your display name:", currentProfile.username);
+  if (newName === null) return; // cancelled
+  const trimmed = newName.trim();
+  if (!trimmed || trimmed === currentProfile.username) return;
+
+  const { error } = await supabase
+    .from("profiles")
+    .update({ username: trimmed })
+    .eq("id", currentProfile.id);
+
+  if (error) {
+    alert("Could not update name: " + error.message);
+    return;
+  }
+  currentProfile.username = trimmed;
+  loadConversations();
 });
 
 // ---------- Find / start a conversation ----------
@@ -598,7 +707,7 @@ async function loadConversations() {
     .from("conversations")
     .select("*")
     .or(`user_a_id.eq.${currentProfile.id},user_b_id.eq.${currentProfile.id}`)
-    .order("created_at", { ascending: false });
+    .order("last_message_at", { ascending: false, nullsFirst: false });
 
   const container = document.getElementById("convoItems");
   container.innerHTML = "";
@@ -608,7 +717,22 @@ async function loadConversations() {
     return;
   }
 
+  // Fetch this user's per-conversation state (hidden / last_read_at) in one go
+  const { data: states } = await supabase
+    .from("conversation_state")
+    .select("*")
+    .eq("user_id", currentProfile.id);
+
+  const stateMap = {};
+  for (const s of states || []) stateMap[s.conversation_id] = s;
+
+  let anyVisible = false;
+
   for (const convo of convos) {
+    const state = stateMap[convo.id];
+    if (state && state.hidden) continue; // deleted for me
+    anyVisible = true;
+
     const otherId = convo.user_a_id === currentProfile.id ? convo.user_b_id : convo.user_a_id;
     const { data: otherProfile } = await supabase
       .from("profiles")
@@ -616,15 +740,73 @@ async function loadConversations() {
       .eq("id", otherId)
       .single();
 
+    const lastReadAt = state ? state.last_read_at : "1970-01-01T00:00:00Z";
+    const { count: unreadCount } = await supabase
+      .from("messages")
+      .select("id", { count: "exact", head: true })
+      .eq("conversation_id", convo.id)
+      .neq("sender_id", currentProfile.id)
+      .gt("created_at", lastReadAt);
+
     const item = document.createElement("div");
     item.className = "convo-item";
     item.innerHTML = `
-      <div class="code">${otherProfile ? otherProfile.username : "Unknown"} · ${otherProfile ? otherProfile.unique_code : "??????"}</div>
-      <div class="preview">Tap to open</div>
+      <div>
+        <div class="code">${otherProfile ? otherProfile.username : "Unknown"} · ${otherProfile ? otherProfile.unique_code : "??????"}</div>
+        <div class="preview">Tap to open</div>
+      </div>
+      <div class="convo-right">
+        ${unreadCount ? `<span class="unread-badge">${unreadCount}</span>` : ""}
+        <button class="convo-delete-btn" title="Delete for me">🗑</button>
+      </div>
     `;
-    item.addEventListener("click", () => openChat(convo, otherProfile ? otherProfile.unique_code : "??????"));
+    item.querySelector(".code").parentElement.addEventListener("click", () =>
+      openChat(convo, otherProfile ? otherProfile.unique_code : "??????")
+    );
+    item.querySelector(".convo-delete-btn").addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm("Delete this conversation for yourself? The other person will still have it.")) return;
+      await supabase.from("conversation_state").upsert({
+        conversation_id: convo.id,
+        user_id: currentProfile.id,
+        hidden: true
+      });
+      loadConversations();
+    });
     container.appendChild(item);
   }
+
+  if (!anyVisible) {
+    container.innerHTML = `<div class="empty-state">No conversations yet. Enter a code above to start one.</div>`;
+  }
+}
+
+// ---------- Keep home screen live: new messages reorder list, bump unread, un-hide ----------
+let homeChannel = null;
+function subscribeToHomeUpdates() {
+  if (homeChannel) supabase.removeChannel(homeChannel);
+  homeChannel = supabase
+    .channel("home-updates-" + currentProfile.id)
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "messages" },
+      async (payload) => {
+        const m = payload.new;
+        if (activeConversation && activeConversation.id === m.conversation_id) return; // already viewing it
+        // Un-hide the conversation for the recipient if they'd deleted it before
+        if (m.sender_id !== currentProfile.id) {
+          await supabase.from("conversation_state").upsert({
+            conversation_id: m.conversation_id,
+            user_id: currentProfile.id,
+            hidden: false
+          });
+        }
+        if (document.getElementById("homeScreen").classList.contains("active")) {
+          loadConversations();
+        }
+      }
+    )
+    .subscribe();
 }
 
 // ---------- Open a chat ----------
@@ -634,6 +816,14 @@ async function openChat(conversation, otherCode) {
   showScreen("chatScreen");
   await loadMessages();
   subscribeToMessages();
+
+  // Mark as read + un-hide (in case it was previously deleted-for-me)
+  await supabase.from("conversation_state").upsert({
+    conversation_id: conversation.id,
+    user_id: currentProfile.id,
+    hidden: false,
+    last_read_at: new Date().toISOString()
+  });
 }
 
 document.getElementById("backBtn").addEventListener("click", () => {
@@ -667,22 +857,142 @@ function renderMessage(m) {
   const div = document.createElement("div");
   const mine = m.sender_id === currentProfile.id;
   div.className = "bubble " + (mine ? "mine" : "theirs");
+  div.dataset.messageId = m.id;
 
-  if (m.type === "image" && m.image_url) {
-    const img = document.createElement("img");
-    img.src = m.image_url;
-    img.alt = "Photo";
-    div.appendChild(img);
-    const timeSpan = document.createElement("span");
-    timeSpan.className = "bubble-time";
-    timeSpan.textContent = formatTime(m.created_at);
-    div.appendChild(timeSpan);
+  if (m.type === "image") {
+    div.classList.add("image-bubble");
+    renderImageBubble(div, m);
   } else {
     div.innerHTML = `${escapeHtml(m.content)}<span class="bubble-time">${formatTime(m.created_at)}</span>`;
+    if (mine) {
+      const unsendBtn = document.createElement("button");
+      unsendBtn.className = "unsend-btn";
+      unsendBtn.title = "Unsend";
+      unsendBtn.textContent = "×";
+      unsendBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm("Unsend this message? It will be removed for both of you.")) return;
+        const { error } = await supabase.from("messages").delete().eq("id", m.id);
+        if (!error) div.remove();
+      });
+      div.appendChild(unsendBtn);
+    }
   }
 
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
+}
+
+// Update an existing message bubble already in the DOM (used for realtime UPDATE events)
+function updateMessageInDom(m) {
+  const container = document.getElementById("messagesEl");
+  const div = container.querySelector(`[data-message-id="${m.id}"]`);
+  if (!div || m.type !== "image") return;
+  renderImageBubble(div, m);
+}
+
+function renderImageBubble(div, m) {
+  if (m.expired) {
+    div.innerHTML = `<div class="expired-photo">📷 Photo expired</div><span class="bubble-time" style="padding-left:20px;">${formatTime(m.created_at)}</span>`;
+    return;
+  }
+
+  if (!m.viewed_at) {
+    div.innerHTML = `<div class="photo-cover">📷 Tap to view<span class="cover-sub">Disappears 30s after opening</span></div>`;
+    div.querySelector(".photo-cover").addEventListener("click", () => revealPhoto(m, div));
+    return;
+  }
+
+  const elapsed = (Date.now() - new Date(m.viewed_at).getTime()) / 1000;
+  const remaining = 30 - elapsed;
+  if (remaining <= 0) {
+    markExpired(m);
+    div.innerHTML = `<div class="expired-photo">📷 Photo expired</div>`;
+    return;
+  }
+  showCountdownImage(div, m, remaining);
+}
+
+async function revealPhoto(m, div) {
+  const { data: updated } = await supabase
+    .from("messages")
+    .update({ viewed_at: new Date().toISOString() })
+    .eq("id", m.id)
+    .is("viewed_at", null)
+    .select()
+    .maybeSingle();
+
+  let viewedAt;
+  if (updated) {
+    viewedAt = updated.viewed_at;
+  } else {
+    // Someone else already opened it first (race) - use the real value
+    const { data: existing } = await supabase
+      .from("messages")
+      .select("viewed_at, expired")
+      .eq("id", m.id)
+      .single();
+    if (existing && existing.expired) {
+      m.expired = true;
+      div.innerHTML = `<div class="expired-photo">📷 Photo expired</div>`;
+      return;
+    }
+    viewedAt = existing ? existing.viewed_at : new Date().toISOString();
+  }
+
+  m.viewed_at = viewedAt;
+  const elapsed = (Date.now() - new Date(viewedAt).getTime()) / 1000;
+  const remaining = 30 - elapsed;
+  if (remaining <= 0) {
+    markExpired(m);
+    div.innerHTML = `<div class="expired-photo">📷 Photo expired</div>`;
+  } else {
+    showCountdownImage(div, m, remaining);
+  }
+}
+
+function showCountdownImage(div, m, remainingSeconds) {
+  const overlayId = "countdown-" + m.id;
+  div.innerHTML = `
+    <img src="${m.image_url}" alt="Photo" />
+    <div class="countdown-overlay" id="${overlayId}">${Math.ceil(remainingSeconds)}s</div>
+    <span class="bubble-time">${formatTime(m.created_at)}</span>
+  `;
+  const endTime = Date.now() + remainingSeconds * 1000;
+
+  const interval = setInterval(() => {
+    const overlay = document.getElementById(overlayId);
+    const secsLeft = Math.max(0, Math.ceil((endTime - Date.now()) / 1000));
+    if (overlay) overlay.textContent = secsLeft + "s";
+    if (secsLeft <= 0) {
+      clearInterval(interval);
+      markExpired(m);
+      div.innerHTML = `<div class="expired-photo">📷 Photo expired</div>`;
+    }
+  }, 1000);
+}
+
+async function markExpired(m) {
+  if (m.expired) return;
+  m.expired = true;
+
+  await supabase
+    .from("messages")
+    .update({ expired: true })
+    .eq("id", m.id)
+    .eq("expired", false);
+
+  try {
+    const url = new URL(m.image_url);
+    const marker = "/chat-images/";
+    const idx = url.pathname.indexOf(marker);
+    if (idx !== -1) {
+      const path = decodeURIComponent(url.pathname.substring(idx + marker.length));
+      await supabase.storage.from("chat-images").remove([path]);
+    }
+  } catch (e) {
+    // best-effort cleanup, ignore failures
+  }
 }
 
 function escapeHtml(str) {
@@ -708,6 +1018,32 @@ function subscribeToMessages() {
       },
       (payload) => {
         renderMessage(payload.new);
+      }
+    )
+    .on(
+      "postgres_changes",
+      {
+        event: "UPDATE",
+        schema: "public",
+        table: "messages",
+        filter: `conversation_id=eq.${activeConversation.id}`
+      },
+      (payload) => {
+        updateMessageInDom(payload.new);
+      }
+    )
+    .on(
+      "postgres_changes",
+      {
+        event: "DELETE",
+        schema: "public",
+        table: "messages",
+        filter: `conversation_id=eq.${activeConversation.id}`
+      },
+      (payload) => {
+        const container = document.getElementById("messagesEl");
+        const div = container.querySelector(`[data-message-id="${payload.old.id}"]`);
+        if (div) div.remove();
       }
     )
     .subscribe();
